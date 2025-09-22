@@ -1,0 +1,38 @@
+import time
+t = time.time()
+time_string = time.strftime("%Y%m%d-%H%M%S", time.localtime(t))
+output_file = './result/' + time_string + '/'
+
+def parse_arguments(parser):
+    """
+    Define all hyperparameters, dataset paths, and model settings for Q-FSRU on medical VQA
+    """
+    parser.add_argument('--num_qubits', type=int, default=8, help='Number of qubits in quantum-inspired augmentation layer')
+    parser.add_argument('--quantum_depth', type=int, default=2, help='Number of quantum circuit layers for feature encoding')
+    parser.add_argument('--quantum_type', type=str, default='variational', help='Type of quantum augmentation (variational/parameterized)')
+    parser.add_argument('--alpha', type=float, default=0.2, help='Weight for intra-modal contrastive loss')
+    parser.add_argument('--beta', type=float, default=0.2, help='Weight for inter-modal contrastive loss')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size (smaller for GPU memory with VQA images)')
+    parser.add_argument('--num_epoch', type=int, default=50, help='Total training epochs')
+    parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate (good for fine-tuning BERT/BioBERT)')
+    parser.add_argument('--decay_rate', type=float, default=0.98, help='Learning rate decay per step')
+    parser.add_argument('--decay_step', type=int, default=5, help='Decay frequency in epochs')
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate in fully connected layers')
+    parser.add_argument('--l2', type=float, default=1e-5, help='L2 regularization weight')
+    parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
+    parser.add_argument('--device', type=str, default='cuda:0', help='GPU device for training/testing')
+    parser.add_argument('--d_model', type=int, default=256, help='Dimension for multimodal fusion features')
+    parser.add_argument('--d_text', type=int, default=768, help='Text embedding dimension (BERT/BioBERT output)')
+    parser.add_argument('--patch_size', type=int, default=16, help='Patch size for image splitting (ViT/CNN)')
+    parser.add_argument('--num_filter', type=int, default=4, help='Number of frequency filters in spectrum compression')
+    parser.add_argument('--num_layer', type=int, default=1, help='Number of fusion block layers')
+    parser.add_argument('--seq_len', type=int, default=50, help='Max question length in words')
+    parser.add_argument('--data_path', type=str, default='/kaggle/input/vqa-rad-visual-question-answering-radiology', help='Path to VQA dataset')
+    parser.add_argument('--input_path', type=str, default='/kaggle/input/vqa-rad-visual-question-answering-radiology/VQA_RAD Image Folder', help='Preprocessed embeddings (optional)')
+    parser.add_argument('--output_path', type=str, default=output_file, help='Output folder for results/checkpoints')
+    parser.add_argument('--vocab_size', type=int, default=30522, help='Vocabulary size for BERT/BioBERT tokenizer')
+    parser.add_argument('--shuffle', type=bool, default=True, help='Shuffle dataset during training')
+    parser.add_argument('--num_class', type=int, default=100, help='Number of answer classes in VQA dataset (set accordingly)')
+    parser.add_argument('--k', type=int, default=5, help='K-fold cross-validation (if required)')
+
+    return parser
