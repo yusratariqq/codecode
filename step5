@@ -1,0 +1,178 @@
+import torch
+import torch.nn as nn
+from torchvision.models import vit_b_16, ViT_B_16_Weights
+import math
+
+class PatchEmbeddingViT(nn.Module):
+    """
+    Uses a pre-trained Vision Transformer (ViT) from torchvision as a strong image encoder.
+    This class handles the patching, positional encoding, and forward pass through the ViT backbone.
+    """
+    def __init__(self, args, use_pretrained=True, freeze_base=False):
+        super().__init__()
+        self.args = args
+        
+        # Load pre-trained ViT model
+        self.vit = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1 if use_pretrained else None)
+        
+        # The output dimension of the ViT base model is 768
+        self.output_dim = self.vit.heads.head.in_features 
+        
+        # Remove the classification head of the ViT, we just want the features
+        self.vit.heads = nn.Identity()
+        
+        # Freeze the base model parameters if required (good for fine-tuning)
+        if freeze_base:
+            for param in self.vit.parameters():
+                param.requires_grad = False
+                
+        # Projection to match your fusion dimension (d_model)
+        self.projection = nn.Linear(self.output_dim, args.d_model) if args.d_model != self.output_dim else nn.Identity()
+        
+        print(f"Loaded ViT-B/16. Output feature dimension: {self.output_dim}, projecting to: {args.d_model}")
+
+    def forward(self, x):
+        """
+        x: input image tensor [batch_size, 3, 224, 224]
+        Returns: [batch_size, args.d_model]
+        """
+        # Forward pass through pre-trained ViT
+        features = self.vit(x) # Output shape: [batch_size, 768]
+        
+        # Project to desired dimension
+        features = self.projection(features)
+        return features
+
+
+class LearnablePositionalEncoding1D(nn.Module):
+    """
+    Learnable positional encoding for sequences (e.g., for text or 1D sequences of patches).
+    This is more flexible than the fixed sinusoidal encoding and can be learned from data.
+    """
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        self.d_model = d_model
+        self.max_len = max_len
+        
+        # Create a learnable parameter matrix for positional embeddings
+        self.pe = nn.Parameter(torch.zeros(1, max_len, d_model))
+        nn.init.trunc_normal_(self.pe, std=0.02)  # Common initialization for positional embs
+        
+    def forward(self, x):
+        """
+        x: input tensor of shape [batch_size, seq_len, d_model]
+        Returns: x + positional_encoding, shape [batch_size, seq_len, d_model]
+        """
+        seq_len = x.size(1)
+        # Add the learnable positional encoding for the actual sequence length
+        x = x + self.pe[:, :seq_len, :]
+        return x
+
+
+class FixedPositionalEncoding1D(nn.Module):
+    """
+    Fixed sinusoidal positional encoding (from original Transformer paper).
+    This is deterministic and does not contain learnable parameters.
+    """
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        self.d_model = d_model
+        
+        # Create fixed positional encoding matrix
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # shape: [1, max_len, d_model]
+        
+        # Register as buffer (not a parameter, so it doesn't get updated by optimizer)
+        self.register_buffer('pe', pe)
+        
+    def forward(self, x):
+        """
+        x: input tensor of shape [batch_size, seq_len, d_model]
+        Returns: x + positional_encoding, shape [batch_size, seq_len, d_model]
+        """
+        seq_len = x.size(1)
+        x = x + self.pe[:, :seq_len, :]
+        return x
+
+
+# =================================================================================
+# INTEGRATION INTO YOUR QFSRU MODEL
+class ArgsObject:
+    def __init__(self, args_dict):
+        for key, value in args_dict.items():
+            setattr(self, key, value)
+
+args_obj = ArgsObject(args)
+
+class QFSRUWithContrastive(nn.Module):
+    def __init__(self, args_obj, W, retriever=None):
+        super().__init__()
+        self.args = args_obj  # <-- assign the passed ArgsObject
+        self.retriever = retriever 
+        
+        # 1. TEXT ENCODING PIPELINE
+        self.text_embedding = nn.Embedding.from_pretrained(torch.FloatTensor(W))
+        self.text_pos_encoder = LearnablePositionalEncoding1D(
+            d_model=W.shape[1], 
+            max_len=self.args.seq_len
+        )
+        self.text_projection = nn.Linear(W.shape[1], self.args.d_model)
+        
+        # 2. IMAGE ENCODING PIPELINE
+        self.image_encoder = PatchEmbeddingViT(self.args, use_pretrained=True, freeze_base=False)
+        
+        # 3. Contrastive Learning Module
+        self.contrastive = DualContrastiveLearning(
+            batch_size=self.args.batch_size,
+            alpha=self.args.alpha,
+            beta=self.args.beta,
+            device=self.args.device
+        )
+        
+        # 4. Classifier
+        self.classifier = nn.Linear(self.args.d_model * 2, self.args.num_class)
+
+        
+    def extract_text_features(self, text):
+        """
+        text: input token indices [batch_size, seq_len]
+        """
+        # Get token embeddings
+        text_emb = self.text_embedding(text)  # [batch_size, seq_len, word_emb_dim]
+        # Add positional information
+        text_emb = self.text_pos_encoder(text_emb)
+        # Mean pooling over sequence length & project to d_model
+        text_features = text_emb.mean(dim=1)  # [batch_size, word_emb_dim]
+        text_features = self.text_projection(text_features)  # [batch_size, d_model]
+        return text_features
+    
+    def extract_image_features(self, image):
+        """
+        image: input image tensor [batch_size, 3, 224, 224]
+        The PatchEmbeddingViT handles patching, positional encoding, and forward pass.
+        """
+        image_features = self.image_encoder(image)  # [batch_size, d_model]
+        return image_features
+        
+    def forward(self, text, image, labels=None, return_features=False):
+        # Extract features
+        text_features = self.extract_text_features(text)
+        image_features = self.extract_image_features(image)
+        
+        # Compute contrastive loss if training
+        contrastive_losses = None
+        if self.training and labels is not None:
+            contrastive_losses = self.contrastive(text_features, image_features, labels)
+        
+        # Fusion and classification (Simple concatenation for now)
+        fused = torch.cat([text_features, image_features], dim=1) # [batch_size, d_model * 2]
+        logits = self.classifier(fused)
+        
+        if return_features:
+            return logits, text_features, image_features, contrastive_losses
+        return logits, contrastive_losses
