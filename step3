@@ -1,0 +1,20 @@
+import torch
+from torch.utils.data import Dataset
+
+class QFSRUDataset(Dataset):
+    def __init__(self, text_embed, image_embed, labels):
+        """
+        text_embed : numpy array of token indices or text embeddings
+        image_embed: numpy array or list of torch tensors (preprocessed images)
+        labels     : numpy array of integer class labels
+        """
+        # Convert everything to tensors
+        self.text = torch.tensor(text_embed, dtype=torch.long)         
+        self.image = torch.stack([img for img in image_embed])         
+        self.label = torch.tensor(labels, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.label)
+
+    def __getitem__(self, idx):
+        return self.text[idx], self.image[idx], self.label[idx]
