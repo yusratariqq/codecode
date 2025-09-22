@@ -1,0 +1,201 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+eps = 1e-8
+T_INTRA = 0.07  # Temperature for intra-modal contrastive
+T_CROSS = 0.05  # Temperature for cross-modal contrastive
+
+class IntraModalContrastiveLoss(nn.Module):
+    """
+    Intra-modal contrastive loss for medical VQA
+    Enhances feature consistency within the same modality
+    """
+    def __init__(self, temperature=T_INTRA, device='cuda'):
+        super(IntraModalContrastiveLoss, self).__init__()
+        self.temperature = temperature
+        self.device = device
+        # Mask is now created dynamically in the forward pass
+
+    def forward(self, modality_features):
+        """
+        modality_features: features from one modality [batch_size, feature_dim]
+        Applies contrastive learning within the same modality
+        """
+        batch_size = modality_features.size(0) # Get the actual batch size dynamically
+        
+        # Create mask to exclude self-comparisons (DYNAMIC based on actual batch size)
+        mask = (~torch.eye(batch_size * 2, batch_size * 2, dtype=torch.bool, device=self.device)).float()
+
+        # Normalize features
+        features = F.normalize(modality_features, dim=1)
+        
+        # Create augmented views with Gaussian Noise
+        noise = torch.randn_like(features) * 0.1
+        features_aug = features + noise
+        
+        # Concatenate original and augmented features
+        all_features = torch.cat([features, features_aug], dim=0)
+        
+        # Compute similarity matrix
+        similarity_matrix = F.cosine_similarity(
+            all_features.unsqueeze(1), all_features.unsqueeze(0), dim=2
+        )
+        
+        # Create positive pairs (original-augmented pairs)
+        positives = torch.cat([
+            torch.diag(similarity_matrix, batch_size),  # orig-aug
+            torch.diag(similarity_matrix, -batch_size)  # aug-orig
+        ])
+        
+        # Compute numerator and denominator
+        numerator = torch.exp(positives / self.temperature)
+        
+        # Sum over all negative pairs
+        denominator = torch.sum(
+            mask * torch.exp(similarity_matrix / self.temperature),
+            dim=1
+        )
+        
+        # Compute loss
+        loss = -torch.log(numerator / denominator + eps)
+        loss = loss.mean()
+        
+        return loss
+
+class CrossModalContrastiveLoss(nn.Module):
+    """
+    Cross-modal contrastive loss for medical VQA
+    Aligns text and image features in joint embedding space
+    """
+    def __init__(self, temperature=T_CROSS, device='cuda'):
+        super(CrossModalContrastiveLoss, self).__init__()
+        self.temperature = temperature
+        self.device = device
+
+    def forward(self, text_features, image_features, labels=None):
+        """
+        text_features: [batch_size, feature_dim]
+        image_features: [batch_size, feature_dim]
+        labels: optional for supervised contrastive learning
+        """
+        batch_size = text_features.size(0)
+        
+        # Normalize features
+        text_features = F.normalize(text_features, dim=1)
+        image_features = F.normalize(image_features, dim=1)
+        
+        # Compute similarity matrix between text and image features
+        similarity_matrix = torch.matmul(text_features, image_features.t())  # [batch_size, batch_size]
+        similarity_matrix /= self.temperature
+        
+        # Positive pairs are diagonal elements (matching text-image pairs)
+        positives = torch.diag(similarity_matrix)
+        
+        if labels is not None:
+            # Supervised contrastive: positive pairs share same class
+            label_matrix = labels.unsqueeze(0) == labels.unsqueeze(1)
+            # Exclude self-pairs
+            label_matrix.fill_diagonal_(False)
+            # Use class-based positives
+            numerator = torch.exp(positives) + torch.sum(
+                label_matrix * torch.exp(similarity_matrix), dim=1
+            )
+        else:
+            # Unsupervised contrastive: only diagonal pairs are positive
+            numerator = torch.exp(positives)
+        
+        # Denominator: sum over all pairs
+        denominator = torch.sum(torch.exp(similarity_matrix), dim=1)
+        
+        # Compute loss
+        loss = -torch.log(numerator / denominator + eps)
+        loss = loss.mean()
+        
+        return loss
+
+class DualContrastiveLearning(nn.Module):
+    """
+    Dual contrastive learning for Q-FSRU architecture
+    Combines intra-modal and cross-modal contrastive losses
+    """
+    def __init__(self, alpha=0.3, beta=0.7, device='cuda'):
+        super(DualContrastiveLearning, self).__init__()
+        self.intra_loss = IntraModalContrastiveLoss(device=device)
+        self.cross_loss = CrossModalContrastiveLoss(device=device)
+        self.alpha = alpha  # Weight for intra-modal loss
+        self.beta = beta    # Weight for cross-modal loss
+        
+    def forward(self, text_features, image_features, labels=None):
+        """
+        Compute dual contrastive loss for medical VQA
+        """
+        # Intra-modal contrastive loss
+        intra_text_loss = self.intra_loss(text_features)
+        intra_image_loss = self.intra_loss(image_features)
+        intra_total_loss = (intra_text_loss + intra_image_loss) / 2
+        
+        # Cross-modal contrastive loss
+        cross_loss = self.cross_loss(text_features, image_features, labels)
+        
+        # Combined loss
+        total_loss = self.alpha * intra_total_loss + self.beta * cross_loss
+        
+        return {
+            'total_loss': total_loss,
+            'intra_text_loss': intra_text_loss,
+            'intra_image_loss': intra_image_loss,
+            'cross_loss': cross_loss
+        }
+
+class QFSRUWithContrastive(nn.Module):
+    def __init__(self, args, W):
+        super().__init__()
+        self.args = args
+        
+        # Your existing components
+        self.text_embedding = nn.Embedding.from_pretrained(torch.FloatTensor(W))
+        self.text_projection = nn.Linear(W.shape[1], args.d_model)
+        
+        # Image encoder (choose one from previous implementation)
+        self.image_encoder = CNNImageEncoder(args)
+        self.image_projection = nn.Linear(self.image_encoder.output_dim, args.d_model)
+        
+        # Contrastive learning module (FIXED: removed batch_size argument)
+        self.contrastive = DualContrastiveLearning(
+            alpha=args.alpha,  # From your argument parser
+            beta=args.beta,    # From your argument parser
+            device=args.device
+        )
+        
+        # Classifier
+        self.classifier = nn.Linear(args.d_model * 2, args.num_class)
+        
+    def forward(self, text, image, labels=None, return_features=False):
+        # Extract features
+        text_features = self.extract_text_features(text)
+        image_features = self.extract_image_features(image)
+        
+        # Compute contrastive loss if training
+        contrastive_losses = None
+        if self.training and labels is not None:
+            contrastive_losses = self.contrastive(text_features, image_features, labels)
+        
+        # Fusion and classification
+        fused = torch.cat([text_features, image_features], dim=1)
+        logits = self.classifier(fused)
+        
+        if return_features:
+            return logits, text_features, image_features, contrastive_losses
+        return logits, contrastive_losses
+    
+    def extract_text_features(self, text):
+        text_emb = self.text_embedding(text)
+        text_features = text_emb.mean(dim=1)
+        text_features = self.text_projection(text_features)
+        return text_features
+    
+    def extract_image_features(self, image):
+        image_features = self.image_encoder(image)
+        image_features = self.image_projection(image_features)
+        return image_features
