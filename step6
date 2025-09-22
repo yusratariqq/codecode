@@ -1,0 +1,66 @@
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModel
+import numpy as np
+import pickle
+from datasets import load_dataset
+from tqdm import tqdm  # Added for progress tracking
+
+# 1️⃣ Stream the dataset
+ds = load_dataset("MedRAG/pubmed", split="train", streaming=True)
+
+# Take first 1,000,000 samples
+subset_size = 1_000_000
+subset = []
+for i, example in enumerate(ds):
+    subset.append(example)
+    if i + 1 >= subset_size:
+        break
+
+# 2️⃣ Extract abstracts (or relevant text field)
+abstracts = [ex['content'] for ex in subset] 
+print(f"Loaded {len(abstracts)} abstracts")
+
+# 3️⃣ Load PubMedBERT for embeddings WITH MULTI-GPU SUPPORT
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
+
+tokenizer = AutoTokenizer.from_pretrained(
+    "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract"
+)
+model = AutoModel.from_pretrained(
+    "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract"
+)
+
+# MULTI-GPU SETUP - KEY CHANGE!
+if torch.cuda.device_count() > 1:
+    print(f"🎯 Using {torch.cuda.device_count()} GPUs for parallel processing!")
+    model = nn.DataParallel(model)  # This enables multi-GPU
+
+model = model.to(device)
+model.eval()
+
+# 4️⃣ Batch embedding function WITH PROGRESS BAR
+def embed_passages(passages, batch_size=32):  # Increased batch size for better GPU utilization
+    embeddings = []
+    with torch.no_grad():
+        for i in tqdm(range(0, len(passages), batch_size), desc="Embedding abstracts", unit="batch"):
+            batch = passages[i:i+batch_size]
+            encoded = tokenizer(
+                batch, padding=True, truncation=True, max_length=256, return_tensors='pt'
+            ).to(device)
+            outputs = model(**encoded)
+            cls_emb = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+            embeddings.append(cls_emb)
+    return np.vstack(embeddings)
+
+# 5️⃣ Embed abstracts
+print("Embedding PubMed abstracts with multi-GPU support...")
+pubmed_embeddings = embed_passages(abstracts, batch_size=32)  # Larger batch size
+
+# 6️⃣ Save embeddings & texts
+np.save('pubmed_embeddings.npy', pubmed_embeddings)
+with open('pubmed_texts.pkl', 'wb') as f:
+    pickle.dump(abstracts, f)
+
+print("✅ Done! Embeddings saved with multi-GPU acceleration.")
