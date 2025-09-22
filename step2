@@ -1,0 +1,155 @@
+"""
+Q-FSRU: Dataset Preparation for Medical VQA (RAD-VQA)
+
+"""
+
+import os
+import copy
+import numpy as np
+import pickle
+import pandas as pd
+from PIL import Image
+from collections import defaultdict
+from torchvision import transforms
+from sklearn.preprocessing import LabelEncoder
+
+def get_image(data_path):
+    """
+    Load and preprocess images for VQA.
+    - Resize to 256, center crop 224 (ViT/CNN standard)
+    - Normalize with ImageNet mean/std
+    """
+    image_dict = {}
+    img_folder = os.path.join(data_path, 'images/')
+    
+    data_transforms = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    for filename in os.listdir(img_folder):
+        try:
+            im = Image.open(os.path.join(img_folder, filename)).convert('RGB')
+            im = data_transforms(im)
+            # store by IMAGEID (without extension)
+            image_dict[filename.split('.')[0]] = im
+        except:
+            print("Error loading image:", filename)
+    
+    print("Total images loaded:", len(image_dict))
+    return image_dict
+
+def get_data(data_path, mode, image_dict, label_encoder=None):
+    """
+    Load questions, image IDs, and answers.
+    Convert answers to numeric labels for multi-class classification.
+    """
+    file = os.path.join(data_path, f'{mode}_data.csv')
+    data = pd.read_csv(file)
+    
+    questions = data['QUESTION'].tolist()
+    image_ids = data['IMAGEID'].tolist()
+    answers = data['ANSWER'].tolist()
+    
+    # Convert answers to numeric labels
+    if label_encoder is None:
+        label_encoder = LabelEncoder()
+        labels = label_encoder.fit_transform(answers)
+    else:
+        labels = label_encoder.transform(answers)
+    
+    texts, images, labels_list = [], [], []
+    
+    for i, img_id in enumerate(image_ids):
+        img_key = img_id.split('/')[-1].split('.')[0]  
+        if img_key in image_dict:
+            texts.append(questions[i].split()) 
+            images.append(image_dict[img_key])
+            labels_list.append(labels[i])
+    
+    print(f'{mode} dataset: {len(texts)} samples loaded')
+    return {'text': texts, 'image': images, 'label': labels_list}, label_encoder
+
+def get_vocab(train_data, test_data):
+    """
+    Build vocabulary from training and test questions
+    """
+    vocab = defaultdict(float)
+    all_text = train_data['text'] + test_data['text']
+    for sentence in all_text:
+        for word in sentence:
+            vocab[word] += 1
+    return vocab, all_text
+
+def add_unknown_words(w2v, vocab, min_df=1, k=32):
+    """
+    Add random embeddings for words not in pretrained word2vec
+    """
+    for word in vocab:
+        if word not in w2v and vocab[word] >= min_df:
+            w2v[word] = np.random.uniform(-0.25, 0.25, k)
+
+def get_W(w2v, k=32):
+    """
+    Create embedding matrix and word-to-index mapping
+    """
+    word_idx_map = dict()
+    W = np.zeros(shape=(len(w2v)+1, k), dtype='float32')
+    W[0] = np.zeros(k, dtype='float32')
+    i = 1
+    for word in w2v:
+        W[i] = w2v[word]
+        word_idx_map[word] = i
+        i += 1
+    return W, word_idx_map
+
+def word2vec(text, word_idx_map, seq_len):
+    """
+    Convert tokenized sentences to integer sequences
+    """
+    word_embedding = []
+    for sentence in text:
+        sentence_embed = [word_idx_map.get(word, 0) for word in sentence]
+        # Padding
+        while len(sentence_embed) < seq_len:
+            sentence_embed.append(0)
+        sentence_embed = sentence_embed[:seq_len]  # truncate
+        word_embedding.append(copy.deepcopy(sentence_embed))
+    return word_embedding
+
+def load_data(args):
+    """
+    Load images, questions, answers, and convert questions to embeddings
+    """
+    print('Loading images...')
+    image_dict = get_image(args.data_path)
+    
+    print('Loading train data...')
+    train_data, label_encoder = get_data(args.data_path, 'train', image_dict)
+    print('Loading test data...')
+    test_data, _ = get_data(args.data_path, 'test', image_dict, label_encoder)
+    
+    # Vocabulary
+    vocab, all_text = get_vocab(train_data, test_data)
+    print("Vocabulary size:", len(vocab))
+    
+    # Load pretrained word2vec
+    print("Loading word2vec embeddings...")
+    word_embedding_path = os.path.join(args.data_path, 'w2v.pickle')
+    w2v = pickle.load(open(word_embedding_path, 'rb'))
+    add_unknown_words(w2v, vocab)
+    W, word_idx_map = get_W(w2v)
+    
+    # Convert text to embedding indices
+    print("Converting text to embeddings...")
+    train_data['text_embed'] = word2vec(train_data['text'], word_idx_map, args.seq_len)
+    test_data['text_embed'] = word2vec(test_data['text'], word_idx_map, args.seq_len)
+    
+    # Merge data
+    text_embed = train_data['text_embed'] + test_data['text_embed']
+    images = train_data['image'] + test_data['image']
+    labels = train_data['label'] + test_data['label']
+    
+    return np.array(text_embed), np.array(images), np.array(labels), W, label_encoder
